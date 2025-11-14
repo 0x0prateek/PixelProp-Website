@@ -1,4 +1,5 @@
-name: Notify Telegram (+manual test)
+name: Notify Telegram (file locations and line ranges)
+
 on:
   push:
   workflow_dispatch:
@@ -64,7 +65,7 @@ jobs:
           echo "before=$BEFORE" >> $GITHUB_OUTPUT
           echo "after=$AFTER" >> $GITHUB_OUTPUT
 
-      - name: Build example-style message + diff
+      - name: Build message (commits, files, locations)
         run: |
           set -euo pipefail
           BEFORE="${{ steps.range.outputs.before }}"
@@ -72,72 +73,130 @@ jobs:
           REPO="${{ github.repository }}"
           REF="${{ github.ref }}"
           API="https://api.telegram.org/bot${BOT_TOKEN}"
+          mkdir -p /tmp/tgmsg
+          COMMITS=/tmp/tgmsg/commits.txt
+          FILES=/tmp/tgmsg/files.txt
+          LOCS=/tmp/tgmsg/locations.txt
+          MESSAGE=/tmp/tgmsg/message.html
 
           if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
             RANGE="$AFTER"
             SHORT_RANGE="${AFTER:0:7}"
+            DIFF_REF="-U0 ${AFTER}"
+            SHOW_CMD="git show --unified=0 ${AFTER}"
           else
-            RANGE="$BEFORE..$AFTER"
+            RANGE="${BEFORE}..${AFTER}"
             SHORT_RANGE="${BEFORE:0:7}..${AFTER:0:7}"
+            DIFF_REF="${BEFORE} ${AFTER}"
+            SHOW_CMD="git diff --unified=0 ${BEFORE} ${AFTER}"
           fi
-
-          mkdir -p /tmp/notif
-          COMMITS=/tmp/notif/commits.txt
-          FILES=/tmp/notif/files.txt
-          SNIPPET=/tmp/notif/snippet.txt
-          DIFF=/tmp/notif/changes_${BEFORE:0:7}_${AFTER:0:7}.diff
-          DIFF_GZ=${DIFF}.gz
-          MESSAGE=/tmp/notif/message.html
 
           if [ "$RANGE" = "$AFTER" ]; then
-            git log -1 --pretty=format:"%h|%an|%ad|%s" --date=iso $AFTER > "$COMMITS"
+            git --no-pager log -1 --pretty=format:"%h|%an|%ad|%s" --date=iso "$AFTER" > "$COMMITS" 2>/dev/null || true
           else
-            git log --reverse --pretty=format:"%h|%an|%ad|%s" --date=iso $RANGE > "$COMMITS"
+            git --no-pager log --reverse --pretty=format:"%h|%an|%ad|%s" --date=iso $BEFORE..$AFTER > "$COMMITS" 2>/dev/null || true
           fi
 
-          git diff --name-status $BEFORE $AFTER > "$FILES" || true
-          git diff --unified=3 $BEFORE $AFTER > "$DIFF" || true
-          gzip -c "$DIFF" > "$DIFF_GZ" || true
-
-          FIRSTFILE=$(head -n 1 "$FILES" | awk '{print $2}')
-          if [ -n "$FIRSTFILE" ]; then
-            git diff --unified=3 $BEFORE $AFTER -- "$FIRSTFILE" | head -n 50 > "$SNIPPET" || true
+          if [ "$RANGE" = "$AFTER" ]; then
+            git --no-pager show --name-status --pretty="" "$AFTER" | sed '/^$/d' > "$FILES" 2>/dev/null || true
+          else
+            git --no-pager diff --name-status $BEFORE $AFTER | sed '/^$/d' > "$FILES" 2>/dev/null || true
           fi
+
+          : > "$LOCS"
+          while IFS=$'\t' read -r status path; do
+            [ -z "$path" ] && continue
+            echo "<file>$status $path</file>" >> "$LOCS"
+            # extract hunk headers and convert to readable ranges
+            # use git diff --unified=0 to get @@ -a,b +c,d @@ lines
+            if [ "$RANGE" = "$AFTER" ]; then
+              hunk_lines=$(git --no-pager show --unified=0 "$AFTER" -- "$path" 2>/dev/null || true)
+            else
+              hunk_lines=$(git --no-pager diff --unified=0 $BEFORE $AFTER -- "$path" 2>/dev/null || true)
+            fi
+            if [ -n "$hunk_lines" ]; then
+              echo "$hunk_lines" | grep -n '^@@ ' | while IFS=: read -r lineno hunk; do
+                # hunk looks like: @@ -old_start,old_len +new_start,new_len @@
+                plus_part=$(echo "$hunk" | sed -n 's/.*+\([0-9][0-9,]*\).*/\1/p')
+                old_part=$(echo "$hunk" | sed -n 's/.*-\([0-9][0-9,]*\).*/\1/p')
+                # parse start and len
+                parse_range() {
+                  r="$1"
+                  if echo "$r" | grep -q ','; then
+                    start=$(echo "$r" | cut -d, -f1)
+                    len=$(echo "$r" | cut -d, -f2)
+                  else
+                    start="$r"
+                    len=1
+                  fi
+                  end=$((start + len - 1))
+                  echo "$start" "$end" "$len"
+                }
+                set -f
+                if [ -n "$plus_part" ]; then
+                  read new_start new_end new_len <<EOF
+$(parse_range "$plus_part")
+EOF
+                  echo "<loc>added ${new_start}-${new_end} (+${new_len}) in ${path}</loc>" >> "$LOCS"
+                fi
+                if [ -n "$old_part" ]; then
+                  read old_start old_end old_len <<EOF
+$(parse_range "$old_part")
+EOF
+                  echo "<loc>removed ${old_start}-${old_end} (-${old_len}) in ${path}</loc>" >> "$LOCS"
+                fi
+                set +f
+              done
+            else
+              # for binary files or pure additions/deletions, record status only
+              : 
+            fi
+          done < "$FILES"
 
           {
-            echo "<b>Repo:</b> ${REPO} — <b>Branch:</b> <code>${REF##*/}</code>"
+            echo "<b>Repository:</b> ${REPO}"
+            echo "<b>Branch:</b> <code>${REF##*/}</code>"
             echo "<b>Range:</b> <code>${SHORT_RANGE}</code>"
             echo ""
-            echo "<b>Commits:</b>"
+            echo "<b>Commits</b>:"
+            count=0
             while IFS='|' read -r short author date subject; do
-              esc=$(echo "$subject" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
-              echo "&nbsp;&nbsp;• <code>${short}</code> — ${esc} <i>by ${author} (${date})</i>"
+              count=$((count+1))
+              esc_subj=$(echo "$subject" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+              echo "&nbsp;&nbsp;• <code>${short}</code> - ${esc_subj} (by ${author} at ${date})"
             done < "$COMMITS"
             echo ""
-            echo "<b>Files changed:</b>"
+            echo "<b>Files changed</b>:"
+            filecount=0
             while read -r line; do
-              esc=$(echo "$line" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
-              echo "&nbsp;&nbsp;<code>${esc}</code>"
+              filecount=$((filecount+1))
+              if [ "${filecount}" -le 50 ]; then
+                esc=$(echo "$line" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+                echo "&nbsp;&nbsp;<code>${esc}</code>"
+              fi
             done < "$FILES"
-            echo ""
-            if [ -s "$SNIPPET" ]; then
-              echo "<b>Snippet — ${FIRSTFILE}</b>"
-              echo "<pre><code>"
-              sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g' "$SNIPPET"
-              echo "</code></pre>"
+            if [ "${filecount}" -gt 50 ]; then
+              echo "&nbsp;&nbsp;... plus $((filecount-50)) more files"
             fi
-            echo "<b>Compare:</b> https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
-            echo "<b>Full diff:</b> attached as <code>$(basename "$DIFF_GZ")</code>"
+            echo ""
+            echo "<b>Locations (file and line ranges where changes occurred)</b>:"
+            # print LOCS entries with basic HTML escaping
+            while read -r loc; do
+              esc_loc=$(echo "$loc" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+              # remove <file> and <loc> tags for display
+              if echo "$esc_loc" | grep -q '<file>'; then
+                display=$(echo "$esc_loc" | sed -e 's/<file>//' -e 's/<\/file>//')
+                echo "&nbsp;&nbsp;<code>${display}</code>"
+              else
+                display=$(echo "$esc_loc" | sed -e 's/<loc>//' -e 's/<\/loc>//')
+                echo "&nbsp;&nbsp;<code>${display}</code>"
+              fi
+            done < "$LOCS"
+            echo ""
+            echo "<b>Compare</b>: https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
           } > "$MESSAGE"
 
           curl -sS -X POST "${API}/sendMessage" \
             -d chat_id="${GROUP_ID}" \
             -d parse_mode=HTML \
-            --data-urlencode "text=$(cat $MESSAGE)" || true
-
-          if [ -f "${DIFF_GZ}" ]; then
-            curl -sS -X POST "${API}/sendDocument" \
-              -F chat_id="${GROUP_ID}" \
-              -F document=@"${DIFF_GZ}" \
-              -F caption="Unified diff ${BEFORE:0:7}..${AFTER:0:7}" || true
-          fi
+            --data-urlencode "text=$(cat "$MESSAGE")" || true
