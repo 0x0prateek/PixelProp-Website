@@ -1,4 +1,4 @@
-name: Notify Telegram (file locations and line ranges)
+name: Notify Telegram (file locations and line ranges, safe send)
 
 on:
   push:
@@ -109,31 +109,27 @@ jobs:
             echo "<b>Branch:</b> <code>${REF##*/}</code>"
             echo "<b>Range:</b> <code>${SHORT_RANGE}</code>"
             echo ""
+
             echo "<b>Commits</b>:"
             while IFS='|' read -r short author date subject; do
               esc_subj=$(echo "${subject}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
-              echo "&nbsp;&nbsp;- <code>${short}</code> - ${esc_subj} (by ${author} at ${date})"
+              echo "• <code>${short}</code> - ${esc_subj} (by ${author} at ${date})"
             done < "${COMMITS}"
             echo ""
+
             echo "<b>Files changed</b>:"
-            filecount=0
             while IFS= read -r line; do
-              filecount=$((filecount+1))
-              if [ "${filecount}" -le 50 ]; then
-                esc=$(echo "${line}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
-                echo "&nbsp;&nbsp;- <code>${esc}</code>"
-              fi
+              esc=$(echo "${line}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+              echo "• <code>${esc}</code>"
             done < "${FILES}"
-            if [ "${filecount}" -gt 50 ]; then
-              echo "&nbsp;&nbsp;... plus $((filecount-50)) more files"
-            fi
             echo ""
+
             echo "<b>Locations (file and line ranges where changes occurred)</b>:"
             while IFS= read -r item; do
               IFS='|' read -r tag a b c d e <<< "${item}" || true
               if [ "${tag}" = "FILE" ]; then
                 esc_file=$(echo "${item}" | sed -n 's/^FILE|//p' | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
-                echo "&nbsp;&nbsp;<code>${esc_file}</code>"
+                echo "• <code>${esc_file}</code>"
               elif [ "${tag}" = "LOC" ]; then
                 type="${a}"
                 path="${b}"
@@ -141,25 +137,25 @@ jobs:
                 end="${d}"
                 len="${e}"
                 if [ "${type}" = "added" ]; then
-                  echo "&nbsp;&nbsp;<code>added ${start}-${end} (+${len}) in ${path}</code>"
+                  echo "  ◦ added ${start}-${end} (+${len}) in ${path}"
                 else
-                  echo "&nbsp;&nbsp;<code>removed ${start}-${end} (-${len}) in ${path}</code>"
+                  echo "  ◦ removed ${start}-${end} (-${len}) in ${path}"
                 fi
               fi
             done < "${LOCS}"
+
             echo ""
-            echo "<b>Compare</b>: https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
+            echo "<b>Compare:</b> https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
           } > "${MESSAGE}"
 
-          TEXT="$(cat "${MESSAGE}" )"
+          TEXT="$(cat "${MESSAGE}")"
           MAX=3900
 
           if [ "${#TEXT}" -gt "${MAX}" ]; then
             PREFIX="${TEXT:0:${MAX}}"
-            SUFFIX=$'\n\n<b>...</b>\n<b>[output truncated due to Telegram length limit]</b>\n\nCompare: https://github.com/'"${REPO}"'/compare/'"${BEFORE}"'...'"${AFTER}"
+            SUFFIX=$'\n\n…\n[output truncated due to Telegram limit]\n\nCompare: https://github.com/'"${REPO}"'/compare/'"${BEFORE}"'...'"${AFTER}"
             TEXT="${PREFIX}${SUFFIX}"
           else
-            # ensure compare link present
             if ! echo "${TEXT}" | grep -q "Compare:"; then
               TEXT="${TEXT}\n\nCompare: https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
             fi
