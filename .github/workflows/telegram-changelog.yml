@@ -1,0 +1,143 @@
+name: Notify Telegram (+manual test)
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 'Base commit SHA (optional)'
+        required: false
+        default: ''
+      head_sha:
+        description: 'Head commit SHA (optional)'
+        required: false
+        default: ''
+      branch:
+        description: 'Branch to use when running manually (optional)'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      GROUP_ID: ${{ secrets.GROUP_ID }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Determine range
+        id: range
+        run: |
+          set -euo pipefail
+          INPUT_BASE="${{ github.event.inputs.base_sha || '' }}"
+          INPUT_HEAD="${{ github.event.inputs.head_sha || '' }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "${INPUT_HEAD}" ]; then
+              AFTER="${INPUT_HEAD}"
+            else
+              AFTER="$(git rev-parse --verify HEAD)"
+            fi
+            if [ -n "${INPUT_BASE}" ]; then
+              BEFORE="${INPUT_BASE}"
+            else
+              if git rev-parse --verify "${AFTER}^" >/dev/null 2>&1; then
+                BEFORE="$(git rev-parse --verify ${AFTER}^)"
+              else
+                BEFORE="0000000000000000000000000000000000000000"
+              fi
+            fi
+          else
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.sha }}"
+            if [ -z "$BEFORE" ]; then
+              BEFORE="0000000000000000000000000000000000000000"
+            fi
+          fi
+          echo "before=$BEFORE" >> $GITHUB_OUTPUT
+          echo "after=$AFTER" >> $GITHUB_OUTPUT
+
+      - name: Build example-style message + diff
+        run: |
+          set -euo pipefail
+          BEFORE="${{ steps.range.outputs.before }}"
+          AFTER="${{ steps.range.outputs.after }}"
+          REPO="${{ github.repository }}"
+          REF="${{ github.ref }}"
+          API="https://api.telegram.org/bot${BOT_TOKEN}"
+
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            RANGE="$AFTER"
+            SHORT_RANGE="${AFTER:0:7}"
+          else
+            RANGE="$BEFORE..$AFTER"
+            SHORT_RANGE="${BEFORE:0:7}..${AFTER:0:7}"
+          fi
+
+          mkdir -p /tmp/notif
+          COMMITS=/tmp/notif/commits.txt
+          FILES=/tmp/notif/files.txt
+          SNIPPET=/tmp/notif/snippet.txt
+          DIFF=/tmp/notif/changes_${BEFORE:0:7}_${AFTER:0:7}.diff
+          DIFF_GZ=${DIFF}.gz
+          MESSAGE=/tmp/notif/message.html
+
+          if [ "$RANGE" = "$AFTER" ]; then
+            git log -1 --pretty=format:"%h|%an|%ad|%s" --date=iso $AFTER > "$COMMITS"
+          else
+            git log --reverse --pretty=format:"%h|%an|%ad|%s" --date=iso $RANGE > "$COMMITS"
+          fi
+
+          git diff --name-status $BEFORE $AFTER > "$FILES" || true
+          git diff --unified=3 $BEFORE $AFTER > "$DIFF" || true
+          gzip -c "$DIFF" > "$DIFF_GZ" || true
+
+          FIRSTFILE=$(head -n 1 "$FILES" | awk '{print $2}')
+          if [ -n "$FIRSTFILE" ]; then
+            git diff --unified=3 $BEFORE $AFTER -- "$FIRSTFILE" | head -n 50 > "$SNIPPET" || true
+          fi
+
+          {
+            echo "<b>Repo:</b> ${REPO} — <b>Branch:</b> <code>${REF##*/}</code>"
+            echo "<b>Range:</b> <code>${SHORT_RANGE}</code>"
+            echo ""
+            echo "<b>Commits:</b>"
+            while IFS='|' read -r short author date subject; do
+              esc=$(echo "$subject" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
+              echo "&nbsp;&nbsp;• <code>${short}</code> — ${esc} <i>by ${author} (${date})</i>"
+            done < "$COMMITS"
+            echo ""
+            echo "<b>Files changed:</b>"
+            while read -r line; do
+              esc=$(echo "$line" | sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g')
+              echo "&nbsp;&nbsp;<code>${esc}</code>"
+            done < "$FILES"
+            echo ""
+            if [ -s "$SNIPPET" ]; then
+              echo "<b>Snippet — ${FIRSTFILE}</b>"
+              echo "<pre><code>"
+              sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g' "$SNIPPET"
+              echo "</code></pre>"
+            fi
+            echo "<b>Compare:</b> https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
+            echo "<b>Full diff:</b> attached as <code>$(basename "$DIFF_GZ")</code>"
+          } > "$MESSAGE"
+
+          curl -sS -X POST "${API}/sendMessage" \
+            -d chat_id="${GROUP_ID}" \
+            -d parse_mode=HTML \
+            --data-urlencode "text=$(cat $MESSAGE)" || true
+
+          if [ -f "${DIFF_GZ}" ]; then
+            curl -sS -X POST "${API}/sendDocument" \
+              -F chat_id="${GROUP_ID}" \
+              -F document=@"${DIFF_GZ}" \
+              -F caption="Unified diff ${BEFORE:0:7}..${AFTER:0:7}" || true
+          fi
