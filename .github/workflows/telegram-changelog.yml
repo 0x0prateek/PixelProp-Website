@@ -151,7 +151,21 @@ jobs:
             echo "<b>Compare</b>: https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
           } > "${MESSAGE}"
 
+          TEXT="$(cat "${MESSAGE}" )"
+          MAX=3900
+
+          if [ "${#TEXT}" -gt "${MAX}" ]; then
+            PREFIX="${TEXT:0:${MAX}}"
+            SUFFIX=$'\n\n<b>...</b>\n<b>[output truncated due to Telegram length limit]</b>\n\nCompare: https://github.com/'"${REPO}"'/compare/'"${BEFORE}"'...'"${AFTER}"
+            TEXT="${PREFIX}${SUFFIX}"
+          else
+            # ensure compare link present
+            if ! echo "${TEXT}" | grep -q "Compare:"; then
+              TEXT="${TEXT}\n\nCompare: https://github.com/${REPO}/compare/${BEFORE}...${AFTER}"
+            fi
+          fi
+
           curl -sS -X POST "${API}/sendMessage" \
             -d chat_id="${GROUP_ID}" \
             -d parse_mode=HTML \
-            --data-urlencode "text@${MESSAGE}" || true
+            --data-urlencode "text=${TEXT}" || true
