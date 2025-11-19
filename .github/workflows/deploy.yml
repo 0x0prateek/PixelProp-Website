@@ -34,7 +34,7 @@ jobs:
           echo "prop.domiadi.com" > dist/CNAME
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: ./dist
+          path: '.'
 
   deploy:
     needs: build
