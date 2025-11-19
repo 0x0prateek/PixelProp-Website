@@ -31,7 +31,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
       - name: Set CNAME
         run: |
-          echo "prop.domiadi.com" > dist/CNAME
+          echo "prop.domiadi.com" > CNAME
       - uses: actions/upload-pages-artifact@v3
         with:
           path: '.'
