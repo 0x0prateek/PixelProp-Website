@@ -1,7 +1,7 @@
 (function () {
   const SOURCES = [
-    { owner: 'Elcapitanoe', repo: 'Build-Prop-BETA', label: 'Elcapitanoe' },
     { owner: 'Pixel-Props', repo: 'build.prop', label: '0x11DFE' },
+    { owner: 'Elcapitanoe', repo: 'Build-Prop-BETA', label: 'Elcapitanoe' }
   ];
 
   function getToken() {
