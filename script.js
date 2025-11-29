@@ -14,16 +14,12 @@
     },
   ];
 
-  // PIF repository configuration
   const PIF_REPO = {
     owner: "xprateek",
     repo: "PIF-JSON-Generator",
-    stableTag: "stable-PIF-20251107",
-    experimentalTag: "experimental-PIF-20251127"
   };
 
-  // Cache for PIF releases to avoid repeated API calls
-  let pifCache = null;
+  let pifReleasesCache = null;
 
   function getToken() {
     const meta = document.querySelector('meta[name="gh-token"]');
@@ -89,45 +85,62 @@
     return releases.filter((r) => !r.draft);
   }
 
-  // Fetch PIF releases and cache them
-  async function fetchPIFReleases() {
-    if (pifCache) return pifCache;
+  async function fetchAllPIFReleases() {
+    if (pifReleasesCache) return pifReleasesCache;
+    const all = await fetchAllReleases(PIF_REPO.owner, PIF_REPO.repo);
     
-    try {
-      const [stableRes, expRes] = await Promise.all([
-        gh(`/repos/${PIF_REPO.owner}/${PIF_REPO.repo}/releases/tags/${PIF_REPO.stableTag}`),
-        gh(`/repos/${PIF_REPO.owner}/${PIF_REPO.repo}/releases/tags/${PIF_REPO.experimentalTag}`)
-      ]);
-
-      const stable = stableRes.ok ? await stableRes.json() : null;
-      const experimental = expRes.ok ? await expRes.json() : null;
-
-      pifCache = { stable, experimental };
-      return pifCache;
-    } catch (err) {
-      console.error("Failed to fetch PIF releases:", err);
-      return { stable: null, experimental: null };
+    // Separate stable and experimental releases
+    const stable = [];
+    const experimental = [];
+    
+    for (const rel of all) {
+      const tagName = (rel.tag_name || "").toLowerCase();
+      if (tagName.includes("stable")) {
+        stable.push(rel);
+      } else if (tagName.includes("experimental")) {
+        experimental.push(rel);
+      }
     }
+    
+    pifReleasesCache = {
+      stable: stable.sort(byPublishedDesc),
+      experimental: experimental.sort(byPublishedDesc)
+    };
+    return pifReleasesCache;
   }
 
-  // Extract device codename from filename (e.g., "Husky_BP3A..." -> "husky")
   function extractCodename(fileName) {
     const match = fileName.match(/^(?:Stable_|EXPERIMENTAL_)?([A-Za-z]+)_/i);
     return match ? match[1].toLowerCase() : null;
   }
 
-  // Find matching PIF file for a given device and type
-  function findPIFFile(codename, releaseType, pifReleases) {
+  // Modified to search in correct release type based on module type
+  function findLatestPIFForCodename(codename, moduleType, pifReleases) {
     if (!codename || !pifReleases) return null;
-
-    const release = releaseType === "beta" ? pifReleases.experimental : pifReleases.stable;
-    if (!release || !release.assets) return null;
-
-    const prefix = releaseType === "beta" ? "EXPERIMENTAL_" : "Stable_PIF_";
+    
+    // Map module type to PIF release type
+    // stable module -> stable PIF (Stable_PIF_*.json)
+    // beta module -> experimental PIF (EXPERIMENTAL_*.json)
+    const releases = moduleType === "beta" ? pifReleases.experimental : pifReleases.stable;
+    
+    if (!releases || !releases.length) return null;
+    
+    // Pattern depends on module type
+    const prefix = moduleType === "beta" ? "EXPERIMENTAL_" : "Stable_PIF_";
     const pattern = new RegExp(`^${prefix}${codename}_.*\\.json$`, "i");
 
-    const asset = release.assets.find(a => pattern.test(a.name));
-    return asset ? asset.browser_download_url : null;
+    // Search through releases for matching codename
+    for (const rel of releases) {
+      if (!rel.assets) continue;
+      const asset = rel.assets.find((a) => pattern.test(a.name));
+      if (asset) {
+        return {
+          name: asset.name,
+          url: asset.browser_download_url,
+        };
+      }
+    }
+    return null;
   }
 
   function sanitizeDeviceName(raw) {
@@ -287,6 +300,7 @@
     document.addEventListener("click", (ev) => {
       const tgt = ev.target;
       if (!(tgt instanceof Element)) return;
+
       if (tgt.closest(".show-checksum-btn")) {
         const btn = tgt.closest(".show-checksum-btn");
         openModalWith(
@@ -295,11 +309,11 @@
         );
       }
     });
+
     closeBtn.addEventListener("click", closeModal);
     if (backdrop) backdrop.addEventListener("click", closeModal);
   }
 
-  // Handle PIF download button clicks
   function initPIFDownloads() {
     document.addEventListener("click", (ev) => {
       const tgt = ev.target;
@@ -320,10 +334,7 @@
     if (!latestRows.length)
       return `<div class="p-6 bg-red-50 text-red-600 rounded-xl text-center border border-red-100 text-sm">No releases found.</div>`;
 
-    // Fetch PIF releases once
-    const pifReleases = await fetchPIFReleases();
-
-    // Download icon SVG (consistent for both buttons)
+    const pifReleasesAll = await fetchAllPIFReleases();
     const downloadIcon = '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>';
 
     return latestRows
@@ -371,9 +382,10 @@
                     checksum: "Checksum not found",
                   };
 
-                // Find matching PIF file
                 const codename = extractCodename(fileNameRaw);
-                const pifUrl = findPIFFile(codename, type, pifReleases);
+                // Pass module type to find correct PIF variant
+                const pifAsset = findLatestPIFForCodename(codename, type, pifReleasesAll);
+                const pifUrl = pifAsset ? pifAsset.url : "";
                 const pifBtnDisabled = !pifUrl;
 
                 return `
@@ -388,9 +400,7 @@
                         <div class="space-y-1.5">
                             <div class="flex items-center gap-2 text-xs text-slate-500">
                                 <svg class="w-3.5 h-3.5 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>
-                                <span class="truncate">${esc(
-                                  meta.deviceName
-                                )}</span>
+                                <span class="truncate">${esc(meta.deviceName)}</span>
                             </div>
                             <div class="flex items-center gap-2 text-xs text-slate-500">
                                 ${downloadIcon}
@@ -400,23 +410,20 @@
                     </div>
                     <div class="space-y-2">
                       <div class="flex items-center gap-2 pt-3 border-t border-slate-200/60">
-                        <a href="${dlUrl}" class="flex-1 text-center px-3 py-2 bg-primary hover:bg-primaryHover text-white text-xs font-semibold rounded-lg transition shadow-sm active:scale-95 flex items-center justify-center gap-1.5" target="_blank">
+                        <a href="${dlUrl}" class="flex-1 text-center px-3 py-2.5 bg-primary hover:bg-primaryHover text-white text-sm font-semibold rounded-lg transition shadow-sm active:scale-95 flex items-center justify-center gap-1.5" target="_blank" title="${fileName}">
                           ${downloadIcon}
                           <span>Download</span>
                         </a>
-                        <button type="button" class="px-3 py-2 bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 text-xs font-medium rounded-lg transition show-checksum-btn active:scale-95" 
-                          data-filename="${attrEscape(
-                            fileNameRaw
-                          )}" data-checksum="${attrEscape(
-                  meta.checksum
-                )}">Hash</button>
-                      </div>
-                      <button type="button" class="w-full px-3 py-2 ${pifBtnDisabled ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300' : 'bg-white hover:bg-blue-50 text-blue-600 border-2 border-blue-300 hover:border-blue-400'} text-xs font-semibold rounded-lg transition shadow-sm ${!pifBtnDisabled ? 'active:scale-95' : ''} download-pif-btn" 
-                        data-pif-url="${attrEscape(pifUrl || '')}" ${pifBtnDisabled ? 'disabled' : ''}>
-                        <span class="flex items-center justify-center gap-1.5">
+                        <button type="button" class="px-3 py-2.5 bg-white hover:bg-slate-100 text-slate-700 text-sm font-medium rounded-lg transition show-checksum-btn active:scale-95 flex items-center justify-center gap-1.5" 
+                          data-filename="${attrEscape(fileNameRaw)}" data-checksum="${attrEscape(meta.checksum)}">
                           ${downloadIcon}
-                          <span>Download PIF</span>
-                        </span>
+                          <span>Hash</span>
+                        </button>
+                      </div>
+                      <button type="button" class="w-full px-3 py-2.5 ${pifBtnDisabled ? "bg-slate-100 text-slate-400 cursor-not-allowed" : "bg-slate-100 hover:bg-slate-200 text-slate-700"} text-sm font-medium rounded-lg transition download-pif-btn flex items-center justify-center gap-1.5" 
+                        data-pif-url="${attrEscape(pifUrl)}">
+                        ${downloadIcon}
+                        <span>Download PIF</span>
                       </button>
                     </div>
                   </div>`;
@@ -436,11 +443,7 @@
                     ${badgeHtml}
                 </div>
                 <p class="text-xs md:text-sm text-slate-500">
-                    By <a href="https://github.com/${esc(
-                      label
-                    )}" target="_blank" class="font-medium text-primary hover:underline">${esc(
-          label
-        )}</a>
+                    By <a href="https://github.com/${esc(label)}" target="_blank" class="font-medium text-primary hover:underline">${esc(label)}</a>
                     &bull; ${pubDate}
                 </p>
               </div>
